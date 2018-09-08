@@ -4,8 +4,9 @@
  * See LICENSE for details
  */
 
-#include "ruby.h"
-#include "rubyio.h"
+#include <ruby.h>
+#include <ruby/io.h>
+#include <ruby/thread.h>
 
 #include <assert.h>
 
@@ -39,6 +40,12 @@ struct buffer_node {
     unsigned start, end;
     struct buffer_node *next;
     unsigned char   data[0];
+};
+
+struct nogvl_io_args {
+    int            fd;
+    int            raise;
+    struct buffer* buf;
 };
 
 static VALUE    cIO_Buffer = Qnil;
@@ -294,8 +301,8 @@ IO_Buffer_prepend(VALUE self, VALUE data)
 static VALUE
 IO_Buffer_read(int argc, VALUE * argv, VALUE self)
 {
-    VALUE  length_obj, str;
-    int    length;
+    VALUE    length_obj, str;
+    unsigned length;
     struct buffer *buf;
 
     Data_Get_Struct(self, struct buffer, buf);
@@ -627,7 +634,6 @@ static int
 buffer_read_frame(struct buffer * buf, VALUE str, char frame_mark)
 {
     unsigned nbytes = 0;
-    struct buffer_node *tmp;
 
     while (buf->size > 0) {
         struct buffer_node *head = buf->head;
@@ -685,22 +691,23 @@ buffer_copy(struct buffer * buf, char *str, unsigned len)
     }
 }
 
-/* Write data from the buffer to a file descriptor */
-static int
-buffer_write_to(struct buffer * buf, int fd)
+static void *
+write_io( void *data )
 {
-    int bytes_written, total_bytes_written = 0;
+    struct nogvl_io_args *args = data;
+    struct buffer * buf = args->buf;
     struct buffer_node *tmp;
-
+    int bytes_written, total_bytes_written = 0;
+    
     while (buf->head) {
-        bytes_written = write(fd, buf->head->data + buf->head->start, buf->head->end - buf->head->start);
+        bytes_written = write(args->fd, buf->head->data + buf->head->start, buf->head->end - buf->head->start);
 
         /* If the write failed... */
         if (bytes_written < 0) {
             if (errno != EAGAIN)
-                rb_sys_fail("write");
+                args->raise = 1;
 
-            return total_bytes_written;
+            return (void*)total_bytes_written;
         }
 
         total_bytes_written += bytes_written;
@@ -709,7 +716,7 @@ buffer_write_to(struct buffer * buf, int fd)
         /* If the write blocked... */
         if (bytes_written < buf->head->end - buf->head->start) {
             buf->head->start += bytes_written;
-            return total_bytes_written;
+            return (void*)total_bytes_written;
         }
         /* Otherwise we wrote the whole buffer */
         tmp = buf->head;
@@ -719,36 +726,36 @@ buffer_write_to(struct buffer * buf, int fd)
         if (!buf->head)
             buf->tail = 0;
     }
-
-    return total_bytes_written;
+    
+    return (void*)total_bytes_written;
 }
 
-/* Read data from a file descriptor to a buffer */
-/* Append data to the front of the buffer */
-static int
-buffer_read_from(struct buffer * buf, int fd)
+static void *
+read_io( void *data )
 {
+    struct nogvl_io_args *args = data;
+    struct buffer * buf = args->buf;
     int      bytes_read, total_bytes_read = 0;
     unsigned nbytes;
-
+    
     /* Empty list needs initialized */
     if (!buf->head) {
         buf->head = buffer_node_new(buf);
         buf->tail = buf->head;
     }
-
+    
     do {
         nbytes = buf->node_size - buf->tail->end;
-        bytes_read = read(fd, buf->tail->data + buf->tail->end, nbytes);
+        bytes_read = read(args->fd, buf->tail->data + buf->tail->end, nbytes);
 
         if (bytes_read == 0) {
-            return -1;
+            return (void*)-1;
             //When the file reaches EOF
         } else if (bytes_read < 0) {
             if (errno != EAGAIN)
-                rb_sys_fail("read");
+                args->raise = 1;
 
-            return total_bytes_read;
+            return (void*)total_bytes_read;
         }
 
         total_bytes_read += bytes_read;
@@ -760,6 +767,41 @@ buffer_read_from(struct buffer * buf, int fd)
             buf->tail = buf->tail->next;
         }
     } while (bytes_read == nbytes);
+    
+    return (void*)total_bytes_read;
+}
 
+/* Write data from the buffer to a file descriptor */
+static int
+buffer_write_to(struct buffer * buf, int fd)
+{
+    struct nogvl_io_args args = { 0 };
+    int total_bytes_written;
+    
+    args.buf = buf;
+    args.fd  = fd;
+    total_bytes_written = (int)rb_thread_call_without_gvl( write_io, &args, 0, 0 );
+    if( args.raise ) {
+        rb_sys_fail("write");
+    }
+    
+    return total_bytes_written;
+}
+
+/* Read data from a file descriptor to a buffer */
+/* Append data to the front of the buffer */
+static int
+buffer_read_from(struct buffer * buf, int fd)
+{
+    struct nogvl_io_args args = { 0 };
+    int      total_bytes_read;
+    
+    args.buf = buf;
+    args.fd  = fd;
+    total_bytes_read = (int)rb_thread_call_without_gvl( read_io, &args, 0, 0 );
+    if( args.raise ) {
+        rb_sys_fail("read");
+    }
+    
     return total_bytes_read;
 }
